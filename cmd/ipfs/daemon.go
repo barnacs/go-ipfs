@@ -3,13 +3,15 @@ package main
 import (
 	_ "expvar"
 	"fmt"
-	_ "github.com/ipfs/go-ipfs/Godeps/_workspace/src/github.com/codahale/metrics/runtime"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
 	"strings"
 
+	_ "github.com/ipfs/go-ipfs/Godeps/_workspace/src/github.com/codahale/metrics/runtime"
 	ma "github.com/ipfs/go-ipfs/Godeps/_workspace/src/github.com/jbenet/go-multiaddr"
+	"github.com/ipfs/go-ipfs/Godeps/_workspace/src/github.com/jbenet/go-multiaddr-net"
+
 	cmds "github.com/ipfs/go-ipfs/commands"
 	"github.com/ipfs/go-ipfs/core"
 	commands "github.com/ipfs/go-ipfs/core/commands"
@@ -192,13 +194,64 @@ func daemonFunc(req cmds.Request, res cmds.Response) {
 		return node, nil
 	}
 
-	// verify api address is valid multiaddr
+	// construct api endpoint
 	apiMaddr, err := ma.NewMultiaddr(cfg.Addresses.API)
 	if err != nil {
 		res.SetError(err, cmds.ErrNormal)
 		return
 	}
 
+	apiLis, err := manet.Listen(apiMaddr)
+	if err != nil {
+		res.SetError(err, cmds.ErrNormal)
+		return
+	}
+	// we might have listened to /tcp/0 - lets see what we are listing on
+	apiMaddr = apiLis.Multiaddr()
+	fmt.Printf("API server listening on %s\n", apiMaddr)
+
+	apiGw := corehttp.NewGateway(corehttp.GatewayConfig{
+		Writable: true,
+		BlockList: &corehttp.BlockList{
+			Decider: func(s string) bool {
+				unrestricted, _, _ := req.Option(unrestrictedApiAccess).Bool()
+				if unrestricted {
+					return true
+				}
+				// for now, only allow paths in the WebUI path
+				for _, webuipath := range corehttp.WebUIPaths {
+					if strings.HasPrefix(s, webuipath) {
+						return true
+					}
+				}
+				return false
+			},
+		},
+	})
+	var opts = []corehttp.ServeOption{
+		corehttp.CommandsOption(*req.Context()),
+		corehttp.WebUIOption,
+		apiGw.ServeOption(),
+		corehttp.VersionOption(),
+		defaultMux("/debug/vars"),
+		defaultMux("/debug/pprof/"),
+	}
+
+	var rootRedirect corehttp.ServeOption
+	if len(cfg.Gateway.RootRedirect) > 0 {
+		rootRedirect = corehttp.RedirectOption("", cfg.Gateway.RootRedirect)
+	}
+
+	if rootRedirect != nil {
+		opts = append(opts, rootRedirect)
+	}
+
+	errc := make(chan error)
+	go func() {
+		errc <- corehttp.Serve(node, apiLis.NetListener(), opts...)
+	}()
+
+	// construct http gateway
 	var gatewayMaddr ma.Multiaddr
 	if len(cfg.Addresses.Gateway) > 0 {
 		// ignore error for gateway address
@@ -209,7 +262,44 @@ func daemonFunc(req cmds.Request, res cmds.Response) {
 		}
 	}
 
-	// mount if the user provided the --mount flag
+	writable, writableOptionFound, err := req.Option(writableKwd).Bool()
+	if err != nil {
+		res.SetError(err, cmds.ErrNormal)
+		return
+	}
+	if !writableOptionFound {
+		writable = cfg.Gateway.Writable
+	}
+
+	if gatewayMaddr != nil {
+
+		gwLis, err := manet.Listen(gatewayMaddr)
+		if err != nil {
+			res.SetError(err, cmds.ErrNormal)
+			return
+		}
+		// we might have listened to /tcp/0 - lets see what we are listing on
+		gatewayMaddr = gwLis.Multiaddr()
+
+		if writable {
+			fmt.Printf("Gateway (writable) server listening on %s\n", gatewayMaddr)
+		} else {
+			fmt.Printf("Gateway (readonly) server listening on %s\n", gatewayMaddr)
+		}
+		var opts = []corehttp.ServeOption{
+			corehttp.VersionOption(),
+			corehttp.IPNSHostnameOption(),
+			corehttp.GatewayOption(writable),
+		}
+		if rootRedirect != nil {
+			opts = append(opts, rootRedirect)
+		}
+		go func() {
+			errc <- corehttp.Serve(node, gwLis.NetListener(), opts...)
+		}()
+	}
+
+	// mount fuse if the user provided the --mount flag
 	mount, _, err := req.Option(mountKwd).Bool()
 	if err != nil {
 		res.SetError(err, cmds.ErrNormal)
@@ -243,75 +333,10 @@ func daemonFunc(req cmds.Request, res cmds.Response) {
 		fmt.Printf("IPNS mounted at: %s\n", nsdir)
 	}
 
-	var rootRedirect corehttp.ServeOption
-	if len(cfg.Gateway.RootRedirect) > 0 {
-		rootRedirect = corehttp.RedirectOption("", cfg.Gateway.RootRedirect)
-	}
-
-	writable, writableOptionFound, err := req.Option(writableKwd).Bool()
-	if err != nil {
-		res.SetError(err, cmds.ErrNormal)
-		return
-	}
-	if !writableOptionFound {
-		writable = cfg.Gateway.Writable
-	}
-
-	if gatewayMaddr != nil {
-		go func() {
-			var opts = []corehttp.ServeOption{
-				corehttp.VersionOption(),
-				corehttp.IPNSHostnameOption(),
-				corehttp.GatewayOption(writable),
-			}
-			if rootRedirect != nil {
-				opts = append(opts, rootRedirect)
-			}
-			if writable {
-				fmt.Printf("Gateway (writable) server listening on %s\n", gatewayMaddr)
-			} else {
-				fmt.Printf("Gateway (readonly) server listening on %s\n", gatewayMaddr)
-			}
-			err := corehttp.ListenAndServe(node, gatewayMaddr.String(), opts...)
-			if err != nil {
-				log.Error(err)
-			}
-		}()
-	}
-
-	gateway := corehttp.NewGateway(corehttp.GatewayConfig{
-		Writable: true,
-		BlockList: &corehttp.BlockList{
-			Decider: func(s string) bool {
-				unrestricted, _, _ := req.Option(unrestrictedApiAccess).Bool()
-				if unrestricted {
-					return true
-				}
-				// for now, only allow paths in the WebUI path
-				for _, webuipath := range corehttp.WebUIPaths {
-					if strings.HasPrefix(s, webuipath) {
-						return true
-					}
-				}
-				return false
-			},
-		},
-	})
-	var opts = []corehttp.ServeOption{
-		corehttp.CommandsOption(*req.Context()),
-		corehttp.WebUIOption,
-		gateway.ServeOption(),
-		corehttp.VersionOption(),
-		defaultMux("/debug/vars"),
-		defaultMux("/debug/pprof/"),
-	}
-
-	if rootRedirect != nil {
-		opts = append(opts, rootRedirect)
-	}
-	fmt.Printf("API server listening on %s\n", apiMaddr)
-	if err := corehttp.ListenAndServe(node, apiMaddr.String(), opts...); err != nil {
-		res.SetError(err, cmds.ErrNormal)
-		return
+	for err := range errc {
+		if err != nil {
+			res.SetError(err, cmds.ErrNormal)
+			return
+		}
 	}
 }
