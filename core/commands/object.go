@@ -16,6 +16,7 @@ import (
 	core "github.com/ipfs/go-ipfs/core"
 	dag "github.com/ipfs/go-ipfs/merkledag"
 	path "github.com/ipfs/go-ipfs/path"
+	ft "github.com/ipfs/go-ipfs/unixfs"
 )
 
 // ErrObjectTooLarge is returned when too much data was read from stdin. current limit 512k
@@ -45,11 +46,12 @@ var ObjectCmd = &cmds.Command{
 'ipfs object' is a plumbing command used to manipulate DAG objects
 directly.`,
 		Synopsis: `
-ipfs object get <key>   - Get the DAG node named by <key>
-ipfs object put <data>  - Stores input, outputs its key
-ipfs object data <key>  - Outputs raw bytes in an object
-ipfs object links <key> - Outputs links pointed to by object
-ipfs object stat <key>  - Outputs statistics of object
+ipfs object get <key>       - Get the DAG node named by <key>
+ipfs object put <data>      - Stores input, outputs its key
+ipfs object data <key>      - Outputs raw bytes in an object
+ipfs object links <key>     - Outputs links pointed to by object
+ipfs object stat <key>      - Outputs statistics of object
+ipfs object new <template>  - Create new ipfs objects
 `,
 	},
 
@@ -59,6 +61,7 @@ ipfs object stat <key>  - Outputs statistics of object
 		"get":   objectGetCmd,
 		"put":   objectPutCmd,
 		"stat":  objectStatCmd,
+		"new":   objectNewCmd,
 	},
 }
 
@@ -346,6 +349,66 @@ Data should be in the format specified by the --inputenc flag.
 		},
 	},
 	Type: Object{},
+}
+
+var objectNewCmd = &cmds.Command{
+	Helptext: cmds.HelpText{
+		Tagline: "creates a new object from an ipfs template",
+		ShortDescription: `
+'ipfs object new' is a plumbing command for creating new DAG nodes.
+`,
+		LongDescription: `
+'ipfs object new' is a plumbing command for creating new DAG nodes.
+By default it creates and returns a new empty merkledag node, but
+you may pass an optional template argument to create a preformatted
+node.
+`,
+	},
+	Arguments: []cmds.Argument{
+		cmds.StringArg("template", false, false, "optional template to use"),
+	},
+	Run: func(req cmds.Request, res cmds.Response) {
+		n, err := req.Context().GetNode()
+		if err != nil {
+			res.SetError(err, cmds.ErrNormal)
+			return
+		}
+
+		node := new(dag.Node)
+		if len(req.Arguments()) == 1 {
+			var err error
+			node, err = nodeFromTemplate(req.Arguments()[0])
+			if err != nil {
+				res.SetError(err, cmds.ErrNormal)
+				return
+			}
+		}
+
+		k, err := n.DAG.Add(node)
+		if err != nil {
+			res.SetError(err, cmds.ErrNormal)
+			return
+		}
+		res.SetOutput(&Object{Hash: k.B58String()})
+	},
+	Marshalers: cmds.MarshalerMap{
+		cmds.Text: func(res cmds.Response) (io.Reader, error) {
+			object := res.Output().(*Object)
+			return strings.NewReader(object.Hash + "\n"), nil
+		},
+	},
+	Type: Object{},
+}
+
+func nodeFromTemplate(template string) (*dag.Node, error) {
+	switch template {
+	case "unixfs-dir":
+		nd := new(dag.Node)
+		nd.Data = ft.FolderPBData()
+		return nd, nil
+	default:
+		return nil, fmt.Errorf("template '%s' not found", template)
+	}
 }
 
 // ErrEmptyNode is returned when the input to 'ipfs object put' contains no data
