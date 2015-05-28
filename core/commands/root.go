@@ -94,6 +94,7 @@ var rootSubcommands = map[string]*cmds.Command{
 	"mount":     MountCmd,
 	"name":      NameCmd,
 	"object":    ObjectCmd,
+	"patch":     PatchCmd,
 	"pin":       PinCmd,
 	"ping":      PingCmd,
 	"refs":      RefsCmd,
