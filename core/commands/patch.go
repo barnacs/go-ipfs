@@ -15,8 +15,25 @@ import (
 
 var PatchCmd = &cmds.Command{
 	Helptext: cmds.HelpText{
-		Tagline:          "Mutate a given merkledag object and return the modified node",
-		ShortDescription: ``,
+		Tagline: "Create a new merkledag object based on an existing one",
+		ShortDescription: `
+'ipfs patch <root> [add-link|rm-link] <args>' is a plumbing command used to
+build custom DAG objects.
+
+Examples:
+
+	EMPTY_DIR=QmUNLLsPACCz1vLxQVkXqqLX5R1X345qqfHbsf67hvA3Nn 
+	BAR=$(echo "bar" | ipfs add -q)
+    ipfs patch $EMPTY_DIR add-link foo $BAR
+
+This takes an empty directory, and adds a link named foo under it, pointing to
+a file containing 'bar', and returns the hash of the new object.
+
+	ipfs patch $FOO_BAR rm-link foo
+
+This removes the link named foo from the hash in $FOO_BAR and returns the
+resulting object hash.
+`,
 	},
 	Options: []cmds.Option{},
 	Arguments: []cmds.Argument{
