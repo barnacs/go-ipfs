@@ -194,17 +194,56 @@ func daemonFunc(req cmds.Request, res cmds.Response) {
 		return node, nil
 	}
 
-	// construct api endpoint
-	apiMaddr, err := ma.NewMultiaddr(cfg.Addresses.API)
+	errc := make(chan error)
+
+	// construct api endpoint - every time
+	go func() {
+		errc <- mountHTTPapi(req)
+	}()
+
+	// construct http gateway - if it is set in the config
+	if len(cfg.Addresses.Gateway) > 0 {
+		go func() {
+			errc <- mountHTTPgw(req)
+		}()
+	}
+
+	// construct fuse mountpoints - if the user provided the --mount flag
+	mount, _, err := req.Option(mountKwd).Bool()
 	if err != nil {
 		res.SetError(err, cmds.ErrNormal)
 		return
 	}
+	if mount {
+		go func() {
+			errc <- mountFuse(req)
+		}()
+	}
+
+	// collect errors
+	for err := range errc {
+		if err != nil {
+			res.SetError(err, cmds.ErrNormal)
+			return
+		}
+	}
+}
+
+// mountHTTPapi collects options, creates listener, prints status message and starts serving requests
+func mountHTTPapi(req cmds.Request) error {
+	cfg, err := req.Context().GetConfig()
+	if err != nil {
+		return fmt.Errorf("mountHTTPapi: GetConfig() failed: %s", err)
+	}
+
+	apiMaddr, err := ma.NewMultiaddr(cfg.Addresses.API)
+	if err != nil {
+		return fmt.Errorf("mountHTTPapi: invalid API address: %q (err: %s)", cfg.Addresses.API, err)
+	}
 
 	apiLis, err := manet.Listen(apiMaddr)
 	if err != nil {
-		res.SetError(err, cmds.ErrNormal)
-		return
+		return fmt.Errorf("mountHTTPapi: manet.Listen(%s) failed: %s", apiMaddr, err)
 	}
 	// we might have listened to /tcp/0 - lets see what we are listing on
 	apiMaddr = apiLis.Multiaddr()
@@ -237,106 +276,101 @@ func daemonFunc(req cmds.Request, res cmds.Response) {
 		defaultMux("/debug/pprof/"),
 	}
 
-	var rootRedirect corehttp.ServeOption
 	if len(cfg.Gateway.RootRedirect) > 0 {
-		rootRedirect = corehttp.RedirectOption("", cfg.Gateway.RootRedirect)
+		opts = append(opts, corehttp.RedirectOption("", cfg.Gateway.RootRedirect))
 	}
 
-	if rootRedirect != nil {
-		opts = append(opts, rootRedirect)
+	node, err := req.Context().ConstructNode()
+	if err != nil {
+		return fmt.Errorf("mountHTTPgw: ConstructNode() failed: %s", err)
 	}
 
-	errc := make(chan error)
-	go func() {
-		errc <- corehttp.Serve(node, apiLis.NetListener(), opts...)
-	}()
+	return corehttp.Serve(node, apiLis.NetListener(), opts...)
+}
 
-	// construct http gateway
-	var gatewayMaddr ma.Multiaddr
-	if len(cfg.Addresses.Gateway) > 0 {
-		// ignore error for gateway address
-		// if there is an error (invalid address), then don't run the gateway
-		gatewayMaddr, _ = ma.NewMultiaddr(cfg.Addresses.Gateway)
-		if gatewayMaddr == nil {
-			log.Errorf("Invalid gateway address: %s", cfg.Addresses.Gateway)
-		}
+// mountHTTPgw collects options, creates listener, prints status message and starts serving requests
+func mountHTTPgw(req cmds.Request) error {
+	cfg, err := req.Context().GetConfig()
+	if err != nil {
+		return fmt.Errorf("mountHTTPgw: GetConfig() failed: %s", err)
+	}
+
+	gatewayMaddr, err := ma.NewMultiaddr(cfg.Addresses.Gateway)
+	if err != nil {
+		return fmt.Errorf("mountHTTPgw: invalid gateway address: %q (err: %s)", cfg.Addresses.Gateway, err)
 	}
 
 	writable, writableOptionFound, err := req.Option(writableKwd).Bool()
 	if err != nil {
-		res.SetError(err, cmds.ErrNormal)
-		return
+		return fmt.Errorf("mountHTTPgw: req.Option(%s) failed: %s", writableKwd, err)
 	}
 	if !writableOptionFound {
 		writable = cfg.Gateway.Writable
 	}
 
-	if gatewayMaddr != nil {
-
-		gwLis, err := manet.Listen(gatewayMaddr)
-		if err != nil {
-			res.SetError(err, cmds.ErrNormal)
-			return
-		}
-		// we might have listened to /tcp/0 - lets see what we are listing on
-		gatewayMaddr = gwLis.Multiaddr()
-
-		if writable {
-			fmt.Printf("Gateway (writable) server listening on %s\n", gatewayMaddr)
-		} else {
-			fmt.Printf("Gateway (readonly) server listening on %s\n", gatewayMaddr)
-		}
-		var opts = []corehttp.ServeOption{
-			corehttp.VersionOption(),
-			corehttp.IPNSHostnameOption(),
-			corehttp.GatewayOption(writable),
-		}
-		if rootRedirect != nil {
-			opts = append(opts, rootRedirect)
-		}
-		go func() {
-			errc <- corehttp.Serve(node, gwLis.NetListener(), opts...)
-		}()
-	}
-
-	// mount fuse if the user provided the --mount flag
-	mount, _, err := req.Option(mountKwd).Bool()
+	gwLis, err := manet.Listen(gatewayMaddr)
 	if err != nil {
-		res.SetError(err, cmds.ErrNormal)
-		return
+		return fmt.Errorf("mountHTTPgw: manet.Listen(%s) failed: %s", gatewayMaddr, err)
 	}
-	if mount {
-		fsdir, found, err := req.Option(ipfsMountKwd).String()
-		if err != nil {
-			res.SetError(err, cmds.ErrNormal)
-			return
-		}
-		if !found {
-			fsdir = cfg.Mounts.IPFS
-		}
+	// we might have listened to /tcp/0 - lets see what we are listing on
+	gatewayMaddr = gwLis.Multiaddr()
 
-		nsdir, found, err := req.Option(ipnsMountKwd).String()
-		if err != nil {
-			res.SetError(err, cmds.ErrNormal)
-			return
-		}
-		if !found {
-			nsdir = cfg.Mounts.IPNS
-		}
-
-		err = commands.Mount(node, fsdir, nsdir)
-		if err != nil {
-			res.SetError(err, cmds.ErrNormal)
-			return
-		}
-		fmt.Printf("IPFS mounted at: %s\n", fsdir)
-		fmt.Printf("IPNS mounted at: %s\n", nsdir)
+	if writable {
+		fmt.Printf("Gateway (writable) server listening on %s\n", gatewayMaddr)
+	} else {
+		fmt.Printf("Gateway (readonly) server listening on %s\n", gatewayMaddr)
+	}
+	var opts = []corehttp.ServeOption{
+		corehttp.VersionOption(),
+		corehttp.IPNSHostnameOption(),
+		corehttp.GatewayOption(writable),
 	}
 
-	for err := range errc {
-		if err != nil {
-			res.SetError(err, cmds.ErrNormal)
-			return
-		}
+	if len(cfg.Gateway.RootRedirect) > 0 {
+		opts = append(opts, corehttp.RedirectOption("", cfg.Gateway.RootRedirect))
 	}
+
+	node, err := req.Context().ConstructNode()
+	if err != nil {
+		return fmt.Errorf("mountHTTPgw: ConstructNode() failed: %s", err)
+	}
+
+	return corehttp.Serve(node, gwLis.NetListener(), opts...)
+}
+
+//collects options and opens the fuse mountpoint
+func mountFuse(req cmds.Request) error {
+	cfg, err := req.Context().GetConfig()
+	if err != nil {
+		return fmt.Errorf("mountFuse: GetConfig() failed: %s", err)
+	}
+
+	fsdir, found, err := req.Option(ipfsMountKwd).String()
+	if err != nil {
+		return fmt.Errorf("mountFuse: req.Option(%s) failed: %s", ipfsMountKwd, err)
+	}
+	if !found {
+		fsdir = cfg.Mounts.IPFS
+	}
+
+	nsdir, found, err := req.Option(ipnsMountKwd).String()
+	if err != nil {
+		return fmt.Errorf("mountFuse: req.Option(%s) failed: %s", ipnsMountKwd, err)
+	}
+	if !found {
+		nsdir = cfg.Mounts.IPNS
+	}
+
+	node, err := req.Context().ConstructNode()
+	if err != nil {
+		return fmt.Errorf("mountFuse: ConstructNode() failed: %s", err)
+	}
+
+	err = commands.Mount(node, fsdir, nsdir)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("IPFS mounted at: %s\n", fsdir)
+	fmt.Printf("IPNS mounted at: %s\n", nsdir)
+	return nil
 }
